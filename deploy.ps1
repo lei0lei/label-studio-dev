@@ -56,12 +56,14 @@ Add-Type -AssemblyName System.Windows.Forms
                     <RowDefinition Height='Auto'/>
                     <RowDefinition Height='Auto'/>
                     <RowDefinition Height='Auto'/>
+                    <RowDefinition Height='Auto'/>
                     <RowDefinition Height='*'/>
                 </Grid.RowDefinitions>
                 <ProgressBar Name='progressInstall' Grid.Row='0' Height='25' Margin='0,0,0,10'/>
                 <CheckBox Name='chkMLBackend' Grid.Row='1' Content='Install Label Studio ML Backend' Foreground='White' Margin='0,0,0,10'/>
                 <Button Name='btnStartInstall' Grid.Row='2' Content='Start Installation' Height='35' Margin='0,0,0,10' FontSize='14' FontWeight='Bold'/>
-                <TextBox Name='txtLogs' Grid.Row='3' Background='#FF1E1E1E' Foreground='#FFD4D4D4' 
+                <TextBlock Name='txtInstallStatus' Grid.Row='3' Foreground='#FF75BEFF' FontSize='14' FontWeight='Bold' Margin='0,0,0,10' Visibility='Collapsed'/>
+                <TextBox Name='txtLogs' Grid.Row='4' Background='#FF1E1E1E' Foreground='#FFD4D4D4' 
                          IsReadOnly='True' VerticalScrollBarVisibility='Auto' TextWrapping='Wrap' FontFamily='Consolas' FontSize='11'/>
             </Grid>
 
@@ -119,6 +121,7 @@ $txtPathPreview = $window.FindName("txtPathPreview")
 $txtPathWarning = $window.FindName("txtPathWarning")
 $chkMLBackend = $window.FindName("chkMLBackend")
 $btnStartInstall = $window.FindName("btnStartInstall")
+$txtInstallStatus = $window.FindName("txtInstallStatus")
 $btnOpenFolder = $window.FindName("btnOpenFolder")
 $progressInstall = $window.FindName("progressInstall")
 $progressInstall.Maximum = 10
@@ -250,6 +253,15 @@ $uiTimer.Add_Tick({
         $sync.Logs.Clear()
         # Batch append to prevent UI flicker/lag
         $txtLogs.AppendText([string]::Concat($logArray))
+        
+        # Limit to 200 lines to keep UI responsive
+        if ($txtLogs.LineCount -gt 200) {
+            $idx = $txtLogs.GetCharacterIndexFromLineIndex($txtLogs.LineCount - 200)
+            if ($idx -gt 0) {
+                $txtLogs.Select(0, $idx)
+                $txtLogs.SelectedText = ""
+            }
+        }
         $txtLogs.ScrollToEnd()
     }
     
@@ -259,8 +271,9 @@ $uiTimer.Add_Tick({
     # Check if finished
     if ($sync.Finished) {
         $uiTimer.Stop()
-        $script:step = 4
-        ShowStep $script:step
+        $txtInstallStatus.Text = "Installation Complete! Click 'Next' to continue."
+        $txtInstallStatus.Visibility = 'Visible'
+        $btnNext.IsEnabled = $true
     }
 })
 
@@ -268,6 +281,15 @@ function Write-Log {
     param($msg)
     $timestamp = Get-Date -Format "HH:mm:ss"
     $txtLogs.AppendText("[$timestamp] $msg`r`n")
+    
+    # Limit to 200 lines to keep UI responsive
+    if ($txtLogs.LineCount -gt 200) {
+        $idx = $txtLogs.GetCharacterIndexFromLineIndex($txtLogs.LineCount - 200)
+        if ($idx -gt 0) {
+            $txtLogs.Select(0, $idx)
+            $txtLogs.SelectedText = ""
+        }
+    }
     $txtLogs.ScrollToEnd()
 }
 
@@ -285,12 +307,16 @@ function Start-Installation {
     $sync.IsRunning = $true
     $sync.Finished = $false
 
+    $txtInstallStatus.Visibility = 'Collapsed'
+    $txtInstallStatus.Text = ""
+    
     # Pass configuration to background
     $sync.RepoLS = $REPO_LABEL_STUDIO
     $sync.RepoML = $REPO_ML_BACKEND
     $sync.WithML = $chkMLBackend.IsChecked
     $sync.InstallPath = Join-Path $txtPath.Text.Trim() "label-studio"
     $sync.LsDir = Join-Path $sync.InstallPath "label-studio-dev"
+    $sync.MlDir = Join-Path $sync.InstallPath "label-studio-ml-backend-dev"
     
     Write-Log "Installation started in background..."
     $uiTimer.Start()
@@ -313,9 +339,20 @@ function Start-Installation {
 
         function Exec {
             param($cmd, $argStr, $dir)
+            
+            $executable = $cmd
+            $arguments = $argStr
+
+            # 仅针对 npm, yarn 使用 cmd.exe /c 转发，解决 Windows 下批处理文件识别问题
+            # 其余命令（如 python, git, poetry）直接运行
+            if ($cmd -match "^(npm|yarn)$") {
+                $executable = "cmd.exe"
+                $arguments = "/c $cmd $argStr"
+            }
+
             $pi = New-Object System.Diagnostics.ProcessStartInfo -Property @{
-                FileName = $cmd
-                Arguments = $argStr
+                FileName = $executable
+                Arguments = $arguments
                 WorkingDirectory = $dir
                 RedirectStandardOutput = $true
                 RedirectStandardError = $true
@@ -325,20 +362,15 @@ function Start-Installation {
                 StandardErrorEncoding = [System.Text.Encoding]::UTF8
             }
             
-            # 环境变量增强：防止 Git 挂起
+            # 环境变量增强
             $pi.EnvironmentVariables["GIT_TERMINAL_PROMPT"] = "0"
             $pi.EnvironmentVariables["GIT_ASKPASS"] = "echo"
             $pi.EnvironmentVariables["SSH_ASKPASS"] = "echo"
-            if ($cmd -eq "git") { 
-                $pi.EnvironmentVariables["GIT_PROGRESS_DELAY"] = "0" 
-                $pi.EnvironmentVariables["TERM"] = "xterm" 
-                $pi.EnvironmentVariables["GIT_FORCE_PROGRESS"] = "1"
-            }
+            $pi.EnvironmentVariables["TERM"] = "xterm"
             
             $p = New-Object System.Diagnostics.Process
             $p.StartInfo = $pi
             
-            # 使用事件驱动的异步读取，彻底防止缓冲区阻塞导致的“挂起”
             $outputHandler = {
                 if ($EventArgs.Data) { $sync.Logs.Add($EventArgs.Data + "`r`n") }
             }
@@ -347,18 +379,20 @@ function Start-Installation {
             Register-ObjectEvent -InputObject $p -EventName "ErrorDataReceived" -Action $outputHandler | Out-Null
             
             try {
-                if (!$p.Start()) { return -1 }
+                if (!$p.Start()) { 
+                    Log "Failed to start process: $cmd"
+                    return -1 
+                }
                 $p.BeginOutputReadLine()
                 $p.BeginErrorReadLine()
                 
-                # 等待进程结束
                 while (!$p.HasExited) {
                     [System.Threading.Thread]::Sleep(100)
                 }
             } catch {
+                Log "Process Start Error: $($_.Exception.Message) (Command: $cmd)"
                 return -2
             } finally {
-                # 显式清理事件订阅
                 Get-Event | Where-Object { $_.SourceEventArgs -eq $p } | Remove-Event -ErrorAction SilentlyContinue
             }
             
@@ -388,50 +422,113 @@ function Start-Installation {
             Log "Switching to dev branch..."
             Exec "git" "checkout dev" $sync.LsDir
 
-            # 3. Clone ML
+            # 3. Clone & Setup ML
             if ($sync.WithML) {
                 $sync.Progress = 3
-                $mlPath = Join-Path $sync.InstallPath "label-studio-ml-backend"
-                if (Test-Path $mlPath) {
+                if (Test-Path $sync.MlDir) {
                     Log "Cleaning legacy ML folder..."
                     try {
-                        $tmpML = "$($mlPath)_old_$(Get-Date -Format 'HHmmss')"
-                        Rename-Item -Path $mlPath -NewName $tmpML -ErrorAction SilentlyContinue
+                        $tmpML = "$($sync.MlDir)_old_$(Get-Date -Format 'HHmmss')"
+                        Rename-Item -Path $sync.MlDir -NewName $tmpML -ErrorAction SilentlyContinue
                         Remove-Item -Path $tmpML -Recurse -Force -ErrorAction SilentlyContinue
                     } catch { Log "Warning: Busy folder. Continuing..." }
                 }
                 
                 Log "Cloning ML Backend (Full Repository)..."
-                $resML = Exec "git" "clone --progress $($sync.RepoML) label-studio-ml-backend" $sync.InstallPath
+                $resML = Exec "git" "clone --progress $($sync.RepoML) label-studio-ml-backend-dev" $sync.InstallPath
                 if ($resML -ne 0) { throw "Git clone ML failed with code $resML" }
                 
-                Log "Switching to dev branch..."
-                Exec "git" "checkout dev" $mlPath
+                Log "Switching to dev branch in ML Backend..."
+                Exec "git" "checkout dev" $sync.MlDir
             }
 
             # 4. Poetry
             $sync.Progress = 4
-            Log "Installing Poetry..."
-            Exec "pip" "install poetry" ""
+            Log "Installing/Updating Poetry..."
+            Exec "python" "-m pip install poetry" ""
 
             # 5. LS Setup
             $sync.Progress = 5
-            Log "Running poetry install (this part is slow)..."
-            Exec "poetry" "install" $sync.LsDir
+            Log "Configuring Poetry to use in-project virtual environment..."
+            # Use 'poetry' directly instead of 'python -m poetry'
+            Exec "poetry" "config virtualenvs.in-project true" $sync.LsDir
+
+            Log "Running poetry install (this part is slow, will create .venv)..."
+            $resInstall = Exec "poetry" "install" $sync.LsDir
+            if ($resInstall -ne 0) { throw "Poetry install failed with code $resInstall" }
             
-            # 6. Django
+            # 6. Django (Run within the activated .venv environment)
             $sync.Progress = 7
+            $venvPython = Join-Path $sync.LsDir ".venv\Scripts\python.exe"
+            
+            if (!(Test-Path $venvPython)) {
+                Log "Warning: Activated .venv python not found. Falling back to poetry run..."
+                $pyCmd = "poetry"
+                $pyArgsMigrate = "run python label_studio/manage.py migrate"
+                $pyArgsCollect = "run python label_studio/manage.py collectstatic --noinput"
+            } else {
+                Log "Activating environment (using $venvPython)..."
+                $pyCmd = $venvPython
+                $pyArgsMigrate = "label_studio/manage.py migrate"
+                $pyArgsCollect = "label_studio/manage.py collectstatic --noinput"
+            }
+
             Log "Running migrations..."
-            Exec "poetry" "run python label_studio/manage.py migrate" $sync.LsDir
+            $resMigrate = Exec $pyCmd $pyArgsMigrate $sync.LsDir
+            if ($resMigrate -ne 0) { throw "Migrate failed with code $resMigrate" }
+
+            # 6.1 Collectstatic
+            $sync.Progress = 8
+            Log "Collecting static files..."
+            $resCollect = Exec $pyCmd $pyArgsCollect $sync.LsDir
+            if ($resCollect -ne 0) { throw "Collectstatic failed with code $resCollect" }
 
             # 7. Frontend
-            $sync.Progress = 8
+            $sync.Progress = 9
             $webDir = Join-Path $sync.LsDir "web"
             if (Test-Path $webDir) {
                 Log "Building Frontend (npm install)..."
-                Exec "npm" "install --legacy-peer-deps" $webDir
+                $resNpmInstall = Exec "npm" "install --legacy-peer-deps" $webDir
+                if ($resNpmInstall -ne 0) { throw "npm install failed with code $resNpmInstall" }
+
+                Log "Ensuring yarn is available (installing globally)..."
+                $resYarn = Exec "npm" "install -g yarn" $webDir
+                if ($resYarn -ne 0) { throw "Global yarn install failed with code $resYarn" }
+
                 Log "Building Frontend (npm run build)..."
-                Exec "npm" "run build" $webDir
+                $resBuild = Exec "npm" "run build" $webDir
+                if ($resBuild -ne 0) { throw "npm run build failed with code $resBuild" }
+            }
+
+            # 7.5 Setup ML Environment (Post-LS Installation)
+            if ($sync.WithML) {
+                Log "Starting ML Backend environment setup..."
+                
+                if (!(Test-Path $sync.MlDir)) {
+                    Log "Warning: ML Backend directory not found, skipping setup."
+                } else {
+                    Log "Creating virtual environment for ML Backend..."
+                    $resVenv = Exec "python" "-m venv .venv" $sync.MlDir
+                    if ($resVenv -ne 0) { throw "ML venv creation failed" }
+
+                    $mlPip = Join-Path $sync.MlDir ".venv\Scripts\pip.exe"
+                    Log "Installing Label Studio SDK in ML environment..."
+                    $resSdk = Exec $mlPip "install git+https://github.com/HumanSignal/label-studio-sdk.git@master" $sync.MlDir
+                    if ($resSdk -ne 0) { throw "ML SDK install failed" }
+
+                    Log "Installing ML Backend dependencies in editable mode..."
+                    $resMlDep = Exec $mlPip "install -e ." $sync.MlDir
+                    if ($resMlDep -ne 0) { throw "ML dependencies install failed" }
+                }
+            }
+
+            # 8. Environment Variable
+            Log "Setting LABEL_STUDIO environment variable..."
+            try {
+                [Environment]::SetEnvironmentVariable("LABEL_STUDIO", $sync.LsDir, "User")
+                Log "LABEL_STUDIO set to $($sync.LsDir)"
+            } catch {
+                Log "Warning: Failed to set environment variable. You may need to set LABEL_STUDIO manually to: $($sync.LsDir)"
             }
 
             $sync.Progress = 10
