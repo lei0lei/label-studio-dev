@@ -244,29 +244,12 @@ $sync = [hashtable]::Synchronized(@{
 $uiTimer = New-Object System.Windows.Threading.DispatcherTimer
 $uiTimer.Interval = [TimeSpan]::FromMilliseconds(100)
 $uiTimer.Add_Tick({
-    # Pull logs from sync object
+    # Pull logs from sync object - optimized for performance
     if ($sync.Logs.Count -gt 0) {
-        $logs = $sync.Logs.ToArray()
+        $logArray = $sync.Logs.ToArray()
         $sync.Logs.Clear()
-        
-        foreach ($line in $logs) {
-            if ($line.StartsWith("`r")) {
-                # In-place update: Replace the last line of the TextBox
-                $lastLineStart = $txtLogs.Text.LastIndexOf("`n")
-                if ($lastLineStart -eq -1) { 
-                    $lastLineStart = 0 
-                } else { 
-                    $lastLineStart += 1 
-                }
-                
-                $txtLogs.SelectionStart = $lastLineStart
-                $txtLogs.SelectionLength = $txtLogs.Text.Length - $lastLineStart
-                $txtLogs.SelectedText = $line.Substring(1)
-            } else {
-                # Normal append
-                $txtLogs.AppendText($line)
-            }
-        }
+        # Batch append to prevent UI flicker/lag
+        $txtLogs.AppendText([string]::Concat($logArray))
         $txtLogs.ScrollToEnd()
     }
     
@@ -342,44 +325,44 @@ function Start-Installation {
                 StandardErrorEncoding = [System.Text.Encoding]::UTF8
             }
             
+            # 环境变量增强：防止 Git 挂起
             $pi.EnvironmentVariables["GIT_TERMINAL_PROMPT"] = "0"
             $pi.EnvironmentVariables["GIT_ASKPASS"] = "echo"
+            $pi.EnvironmentVariables["SSH_ASKPASS"] = "echo"
             if ($cmd -eq "git") { 
+                $pi.EnvironmentVariables["GIT_PROGRESS_DELAY"] = "0" 
                 $pi.EnvironmentVariables["TERM"] = "xterm" 
                 $pi.EnvironmentVariables["GIT_FORCE_PROGRESS"] = "1"
             }
             
+            $p = New-Object System.Diagnostics.Process
+            $p.StartInfo = $pi
+            
+            # 使用事件驱动的异步读取，彻底防止缓冲区阻塞导致的“挂起”
+            $outputHandler = {
+                if ($EventArgs.Data) { $sync.Logs.Add($EventArgs.Data + "`r`n") }
+            }
+            
+            Register-ObjectEvent -InputObject $p -EventName "OutputDataReceived" -Action $outputHandler | Out-Null
+            Register-ObjectEvent -InputObject $p -EventName "ErrorDataReceived" -Action $outputHandler | Out-Null
+            
             try {
-                $p = [System.Diagnostics.Process]::Start($pi)
+                if (!$p.Start()) { return -1 }
+                $p.BeginOutputReadLine()
+                $p.BeginErrorReadLine()
                 
-                $sb = New-Object System.Text.StringBuilder
-                
-                # Manual character-by-character reading to capture \r
-                while (!$p.HasExited -or $p.StandardOutput.Peek() -ge 0 -or $p.StandardError.Peek() -ge 0) {
-                    $hasData = $false
-                    foreach ($stream in @($p.StandardOutput, $p.StandardError)) {
-                        if ($stream.Peek() -ge 0) {
-                            $hasData = $true
-                            $char = [char]$stream.Read()
-                            
-                            if ($char -eq "`r" -or $char -eq "`n") {
-                                if ($sb.Length -gt 0) {
-                                    $line = $sb.ToString()
-                                    if ($char -eq "`r") { $sync.Logs.Add("`r$line") }
-                                    else { $sync.Logs.Add("$line`r`n") }
-                                    $sb.Clear()
-                                }
-                            } else {
-                                $sb.Append($char)
-                            }
-                        }
-                    }
-                    if (!$hasData) { [System.Threading.Thread]::Sleep(20) }
+                # 等待进程结束
+                while (!$p.HasExited) {
+                    [System.Threading.Thread]::Sleep(100)
                 }
-                return $p.ExitCode
             } catch {
                 return -2
+            } finally {
+                # 显式清理事件订阅
+                Get-Event | Where-Object { $_.SourceEventArgs -eq $p } | Remove-Event -ErrorAction SilentlyContinue
             }
+            
+            return $p.ExitCode
         }
 
         try {
