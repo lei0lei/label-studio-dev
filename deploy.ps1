@@ -5,8 +5,8 @@ Add-Type -AssemblyName System.Windows.Forms
 
 [xml]$xaml = @"
 <Window xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation'
-        Title='Label Studio Installer' Height='500' Width='600'
-        WindowStartupLocation='CenterScreen' Background='#FF2D2D30' ResizeMode='NoResize'>
+        Title='Label Studio Installer' Height='600' Width='800'
+        WindowStartupLocation='CenterScreen' Background='#FF2D2D30' ResizeMode='CanResizeWithGrip'>
     <Grid Margin='20'>
         <Grid.RowDefinitions>
             <RowDefinition Height='Auto'/> <!-- Step Title -->
@@ -70,8 +70,12 @@ Add-Type -AssemblyName System.Windows.Forms
                 <TextBlock Foreground='White' FontSize='18' FontWeight='Bold' HorizontalAlignment='Center' Margin='0,50,0,10'>
                     Installation Complete!
                 </TextBlock>
-                <TextBlock Foreground='White' HorizontalAlignment='Center'>
+                <TextBlock Foreground='White' HorizontalAlignment='Center' Margin='0,0,0,30'>
                     Label Studio has been successfully installed.
+                </TextBlock>
+                <Button Name='btnOpenFolder' Content='Open Installation Folder' Width='200' Height='35' HorizontalAlignment='Center'/>
+                <TextBlock Foreground='#FFAAAAAA' FontSize='11' HorizontalAlignment='Center' Margin='0,20,0,0'>
+                    You can start the server by running `poetry run python label_studio/manage.py runserver` in the label-studio-dev directory.
                 </TextBlock>
             </StackPanel>
         </Grid>
@@ -115,11 +119,17 @@ $txtPathPreview = $window.FindName("txtPathPreview")
 $txtPathWarning = $window.FindName("txtPathWarning")
 $chkMLBackend = $window.FindName("chkMLBackend")
 $btnStartInstall = $window.FindName("btnStartInstall")
+$btnOpenFolder = $window.FindName("btnOpenFolder")
 $progressInstall = $window.FindName("progressInstall")
+$progressInstall.Maximum = 10
 $txtLogs = $window.FindName("txtLogs")
 
 # Initialize Path
 $txtPath.Text = $env:USERPROFILE
+
+# --- Configuration ---
+$REPO_LABEL_STUDIO = "https://github.com/lei0lei/label-studio-dev.git" # Replace with your fork
+$REPO_ML_BACKEND = "https://github.com/lei0lei/label-studio-ml-backend-dev.git" # Replace with your fork
 
 # --- Functions ---
 
@@ -215,6 +225,62 @@ function Check-Environment {
     }
 }
 
+# Create a synchronized hashtable for thread-safe UI updates
+$sync = [hashtable]::Synchronized(@{
+    Logs = [System.Collections.Generic.List[string]]::new()
+    Progress = 0
+    Finished = $false
+    IsRunning = $false
+    Error = $null
+    # Config values
+    RepoLS = $REPO_LABEL_STUDIO
+    RepoML = $REPO_ML_BACKEND
+    InstallPath = ""
+    LsDir = ""
+    WithML = $false
+})
+
+# UI Update Timer (Ticks every 100ms)
+$uiTimer = New-Object System.Windows.Threading.DispatcherTimer
+$uiTimer.Interval = [TimeSpan]::FromMilliseconds(100)
+$uiTimer.Add_Tick({
+    # Pull logs from sync object
+    if ($sync.Logs.Count -gt 0) {
+        $logs = $sync.Logs.ToArray()
+        $sync.Logs.Clear()
+        
+        foreach ($line in $logs) {
+            if ($line.StartsWith("`r")) {
+                # In-place update: Replace the last line of the TextBox
+                $lastLineStart = $txtLogs.Text.LastIndexOf("`n")
+                if ($lastLineStart -eq -1) { 
+                    $lastLineStart = 0 
+                } else { 
+                    $lastLineStart += 1 
+                }
+                
+                $txtLogs.SelectionStart = $lastLineStart
+                $txtLogs.SelectionLength = $txtLogs.Text.Length - $lastLineStart
+                $txtLogs.SelectedText = $line.Substring(1)
+            } else {
+                # Normal append
+                $txtLogs.AppendText($line)
+            }
+        }
+        $txtLogs.ScrollToEnd()
+    }
+    
+    # Update Progress
+    $progressInstall.Value = $sync.Progress
+    
+    # Check if finished
+    if ($sync.Finished) {
+        $uiTimer.Stop()
+        $script:step = 4
+        ShowStep $script:step
+    }
+})
+
 function Write-Log {
     param($msg)
     $timestamp = Get-Date -Format "HH:mm:ss"
@@ -222,54 +288,181 @@ function Write-Log {
     $txtLogs.ScrollToEnd()
 }
 
+# Variable to track the background job
+$script:PowerShellInstance = $null
+
 function Start-Installation {
     $btnStartInstall.IsEnabled = $false
     $chkMLBackend.IsEnabled = $false
     $btnNext.IsEnabled = $false
     $btnBack.IsEnabled = $false
     
-    # Correct final installation path
-    $basePath = $txtPath.Text.Trim()
-    $installPath = Join-Path $basePath "label-studio"
-    $withML = $chkMLBackend.IsChecked
+    $sync.Logs.Clear()
+    $sync.Progress = 0
+    $sync.IsRunning = $true
+    $sync.Finished = $false
+
+    # Pass configuration to background
+    $sync.RepoLS = $REPO_LABEL_STUDIO
+    $sync.RepoML = $REPO_ML_BACKEND
+    $sync.WithML = $chkMLBackend.IsChecked
+    $sync.InstallPath = Join-Path $txtPath.Text.Trim() "label-studio"
+    $sync.LsDir = Join-Path $sync.InstallPath "label-studio-dev"
     
-    Write-Log "Starting installation..."
-    Write-Log "Target path: $installPath"
-    if ($withML) { Write-Log "Option: Include Label Studio ML Backend" }
+    Write-Log "Installation started in background..."
+    $uiTimer.Start()
+
+    # Create background Runspace
+    $rs = [runspacefactory]::CreateRunspace()
+    $rs.ApartmentState = "STA"
+    $rs.Open()
+    $rs.SessionStateProxy.SetVariable("sync", $sync)
     
-    $steps = @(
-        "Checking directory existence...",
-        "Creating directory: $installPath",
-        "Cloning Label Studio repository...",
-        "Setting up virtual environment...",
-        "Installing dependencies (this may take a while)...",
-        "Configuring database...",
-        "Finalizing installation..."
-    )
-    
-    if ($withML) {
-        $steps += "Installing ML Backend..."
-    }
-    
-    $progressInstall.Minimum = 0
-    $progressInstall.Maximum = $steps.Count
-    $progressInstall.Value = 0
-    
-    for ($i = 0; $i -lt $steps.Count; $i++) {
-        $currentStep = $steps[$i]
-        Write-Log $currentStep
-        
-        # Simulate work
-        Start-Sleep -Seconds 1
-        
-        # Force UI update (Simple way for PowerShell scripts)
-        $progressInstall.Value = $i + 1
-        [System.Windows.Forms.Application]::DoEvents()
-    }
-    
-    Write-Log "Installation finished successfully!"
-    $btnNext.IsEnabled = $true
-    $btnNext.Content = "Next"
+    $psInstance = [powershell]::Create().AddScript({
+        function Log {
+            param($msg, $clean = $false)
+            if ($clean) { $sync.Logs.Add($msg) }
+            else {
+                $ts = Get-Date -Format "HH:mm:ss"
+                $sync.Logs.Add("[$ts] $msg`r`n")
+            }
+        }
+
+        function Exec {
+            param($cmd, $argStr, $dir)
+            $pi = New-Object System.Diagnostics.ProcessStartInfo -Property @{
+                FileName = $cmd
+                Arguments = $argStr
+                WorkingDirectory = $dir
+                RedirectStandardOutput = $true
+                RedirectStandardError = $true
+                UseShellExecute = $false
+                CreateNoWindow = $true
+                StandardOutputEncoding = [System.Text.Encoding]::UTF8
+                StandardErrorEncoding = [System.Text.Encoding]::UTF8
+            }
+            
+            $pi.EnvironmentVariables["GIT_TERMINAL_PROMPT"] = "0"
+            $pi.EnvironmentVariables["GIT_ASKPASS"] = "echo"
+            if ($cmd -eq "git") { 
+                $pi.EnvironmentVariables["TERM"] = "xterm" 
+                $pi.EnvironmentVariables["GIT_FORCE_PROGRESS"] = "1"
+            }
+            
+            try {
+                $p = [System.Diagnostics.Process]::Start($pi)
+                
+                $sb = New-Object System.Text.StringBuilder
+                
+                # Manual character-by-character reading to capture \r
+                while (!$p.HasExited -or $p.StandardOutput.Peek() -ge 0 -or $p.StandardError.Peek() -ge 0) {
+                    $hasData = $false
+                    foreach ($stream in @($p.StandardOutput, $p.StandardError)) {
+                        if ($stream.Peek() -ge 0) {
+                            $hasData = $true
+                            $char = [char]$stream.Read()
+                            
+                            if ($char -eq "`r" -or $char -eq "`n") {
+                                if ($sb.Length -gt 0) {
+                                    $line = $sb.ToString()
+                                    if ($char -eq "`r") { $sync.Logs.Add("`r$line") }
+                                    else { $sync.Logs.Add("$line`r`n") }
+                                    $sb.Clear()
+                                }
+                            } else {
+                                $sb.Append($char)
+                            }
+                        }
+                    }
+                    if (!$hasData) { [System.Threading.Thread]::Sleep(20) }
+                }
+                return $p.ExitCode
+            } catch {
+                return -2
+            }
+        }
+
+        try {
+            # 1. Directory
+            $sync.Progress = 1
+            if (!(Test-Path $sync.InstallPath)) { New-Item -Path $sync.InstallPath -ItemType Directory | Out-Null }
+            
+            # 2. Clone LS
+            $sync.Progress = 2
+            Log "Cleaning target folder (if exists)..."
+            if (Test-Path $sync.LsDir) {
+                try {
+                    $tmpLS = "$($sync.LsDir)_old_$(Get-Date -Format 'HHmmss')"
+                    Rename-Item -Path $sync.LsDir -NewName $tmpLS -ErrorAction SilentlyContinue
+                    Remove-Item -Path $tmpLS -Recurse -Force -ErrorAction SilentlyContinue
+                } catch { Log "Warning: Busy folder. Continuing..." }
+            }
+            
+            Log "Cloning Label Studio (Full Repository)..."
+            $res = Exec "git" "clone --progress $($sync.RepoLS) label-studio-dev" $sync.InstallPath
+            if ($res -ne 0) { throw "Git clone LS failed with code $res" }
+            
+            Log "Switching to dev branch..."
+            Exec "git" "checkout dev" $sync.LsDir
+
+            # 3. Clone ML
+            if ($sync.WithML) {
+                $sync.Progress = 3
+                $mlPath = Join-Path $sync.InstallPath "label-studio-ml-backend"
+                if (Test-Path $mlPath) {
+                    Log "Cleaning legacy ML folder..."
+                    try {
+                        $tmpML = "$($mlPath)_old_$(Get-Date -Format 'HHmmss')"
+                        Rename-Item -Path $mlPath -NewName $tmpML -ErrorAction SilentlyContinue
+                        Remove-Item -Path $tmpML -Recurse -Force -ErrorAction SilentlyContinue
+                    } catch { Log "Warning: Busy folder. Continuing..." }
+                }
+                
+                Log "Cloning ML Backend (Full Repository)..."
+                $resML = Exec "git" "clone --progress $($sync.RepoML) label-studio-ml-backend" $sync.InstallPath
+                if ($resML -ne 0) { throw "Git clone ML failed with code $resML" }
+                
+                Log "Switching to dev branch..."
+                Exec "git" "checkout dev" $mlPath
+            }
+
+            # 4. Poetry
+            $sync.Progress = 4
+            Log "Installing Poetry..."
+            Exec "pip" "install poetry" ""
+
+            # 5. LS Setup
+            $sync.Progress = 5
+            Log "Running poetry install (this part is slow)..."
+            Exec "poetry" "install" $sync.LsDir
+            
+            # 6. Django
+            $sync.Progress = 7
+            Log "Running migrations..."
+            Exec "poetry" "run python label_studio/manage.py migrate" $sync.LsDir
+
+            # 7. Frontend
+            $sync.Progress = 8
+            $webDir = Join-Path $sync.LsDir "web"
+            if (Test-Path $webDir) {
+                Log "Building Frontend (npm install)..."
+                Exec "npm" "install --legacy-peer-deps" $webDir
+                Log "Building Frontend (npm run build)..."
+                Exec "npm" "run build" $webDir
+            }
+
+            $sync.Progress = 10
+            Log "Installation Finished Successfully!"
+            $sync.Finished = $true
+        } catch {
+            Log "STOPPED: $_"
+        } finally {
+            $sync.IsRunning = $false
+        }
+    })
+    $psInstance.Runspace = $rs
+    $script:PowerShellInstance = $psInstance
+    $null = $psInstance.BeginInvoke()
 }
 
 # Step definitions
@@ -380,8 +573,23 @@ $btnBrowse.Add_Click({
     }
 })
 
+$btnOpenFolder.Add_Click({
+    $installPath = Join-Path $txtPath.Text.Trim() "label-studio"
+    if (Test-Path $installPath) {
+        explorer.exe $installPath
+    }
+})
+
 $btnStartInstall.Add_Click({
     Start-Installation
+})
+
+$window.Add_Closing({
+    if ($script:CurrentProcess -and !$script:CurrentProcess.HasExited) {
+        try {
+            $script:CurrentProcess.Kill()
+        } catch {}
+    }
 })
 
 $window.ShowDialog()
