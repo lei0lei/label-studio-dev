@@ -44,6 +44,7 @@ if (-not $lsPath) {
                 </Grid.RowDefinitions>
                 <StackPanel Grid.Row='0' Margin='0,0,0,10'>
                     <TextBlock Text='Label Studio Server' FontSize='16' FontWeight='Bold' Foreground='#FF75BEFF'/>
+                    <TextBlock Text='URL: http://127.0.0.1:8080' FontSize='11' Foreground='#FFAAAAAA' Margin='0,2,0,0'/>
                     <StackPanel Orientation='Horizontal' Margin='0,10,0,5'>
                         <Button Name='btnStart' Content='Start Server' Width='120' Height='35' Background='#FF007ACC' Foreground='White' BorderThickness='0'/>
                         <TextBlock Name='txtStatus' Text='Ready' VerticalAlignment='Center' Margin='15,0,0,0' Foreground='#FF4CD964' FontWeight='Bold'/>
