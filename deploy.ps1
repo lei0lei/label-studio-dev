@@ -150,39 +150,44 @@ function Check-Environment {
     $chkGit.IsChecked = $false
     $chkNode.IsChecked = $false
 
-    # List all Python versions found in PATH
+    # Check Python (3.10+) - Search all available pythons in PATH
     try {
         $pyPaths = where.exe python 2>$null
         $allPyVers = @()
         foreach ($path in $pyPaths) {
-            $ver = & $path --version 2>&1
-            $allPyVers += "$ver ($path)"
+            $verOutput = & $path --version 2>&1
+            $verStr = "$verOutput".Trim()
+            $allPyVers += "$verStr ($path)"
+            
+            # If we haven't found a compliant python yet, check this one
+            if (-not $pythonOk) {
+                # Flexible regex for 2 or 3 version components
+                $pyVerMatch = [regex]::Match($verStr, "(\d+\.\d+(?:\.\d+)?)")
+                if ($pyVerMatch.Success) {
+                    $vStr = $pyVerMatch.Groups[1].Value
+                    $pyVer = [version]$vStr
+                    if ($pyVer -ge [version]"3.10") {
+                        $chkPython.Content = "Python: Found ($verStr)"
+                        $chkPython.IsChecked = $true
+                        $pythonOk = $true
+                        $sync.PythonPath = $path # Lock this path for installation
+                    }
+                }
+            }
         }
         if ($allPyVers.Count -gt 0) {
             $lblAllPython.Text = "Found Python(s):`n" + ($allPyVers -join "`n")
         }
-    } catch {}
-
-    # Check Python (3.10+)
-    try {
-        $pyFullVer = python --version 2>&1
-        if ($LASTEXITCODE -eq 0) {
-            $pyVerMatch = [regex]::Match($pyFullVer, "(\d+\.\d+\.\d+)")
-            if ($pyVerMatch.Success) {
-                $pyVer = [version]$pyVerMatch.Groups[1].Value
-                if ($pyVer -ge [version]"3.10") {
-                    $chkPython.Content = "Python: Found ($pyFullVer)"
-                    $chkPython.IsChecked = $true
-                    $pythonOk = $true
-                } else {
-                    $chkPython.Content = "Python: Too old ($pyFullVer). Need 3.10+"
-                }
+        
+        if (-not $pythonOk) {
+            if ($allPyVers.Count -gt 0) {
+                $chkPython.Content = "Python: Versions found are too old. Need 3.10+"
+            } else {
+                $chkPython.Content = "Python: Not found"
             }
-        } else {
-            $chkPython.Content = "Python: Not found"
         }
     } catch {
-        $chkPython.Content = "Python: Not found"
+        $chkPython.Content = "Python: Error checking versions"
     }
 
     # Check Git
@@ -203,7 +208,8 @@ function Check-Environment {
     try {
         $nodeFullVer = node --version 2>&1
         if ($LASTEXITCODE -eq 0) {
-            $nodeVerMatch = [regex]::Match($nodeFullVer, "(\d+\.\d+\.\d+)")
+            # Flexible regex for node versions
+            $nodeVerMatch = [regex]::Match($nodeFullVer, "(\d+\.\d+(?:\.\d+)?)")
             if ($nodeVerMatch.Success) {
                 $nodeVer = [version]$nodeVerMatch.Groups[1].Value
                 if ($nodeVer.Major -ge 21) {
@@ -238,6 +244,7 @@ $sync = [hashtable]::Synchronized(@{
     # Config values
     RepoLS = $REPO_LABEL_STUDIO
     RepoML = $REPO_ML_BACKEND
+    PythonPath = "python"
     InstallPath = ""
     LsDir = ""
     WithML = $false
@@ -251,8 +258,15 @@ $uiTimer.Add_Tick({
     if ($sync.Logs.Count -gt 0) {
         $logArray = $sync.Logs.ToArray()
         $sync.Logs.Clear()
+
+        # Clean ANSI escape codes (e.g., color codes like [31m)
+        $cleanedLogs = foreach ($line in $logArray) {
+            # Regex to match ANSI escape sequences
+            $line -replace "\x1b\[[0-9;]*[mKJK]", "" -replace "\x1b\(B", ""
+        }
+        
         # Batch append to prevent UI flicker/lag
-        $txtLogs.AppendText([string]::Concat($logArray))
+        $txtLogs.AppendText([string]::Concat($cleanedLogs))
         
         # Limit to 200 lines to keep UI responsive
         if ($txtLogs.LineCount -gt 200) {
@@ -406,18 +420,13 @@ function Start-Installation {
             
             # 2. Clone LS
             $sync.Progress = 2
-            Log "Cleaning target folder (if exists)..."
             if (Test-Path $sync.LsDir) {
-                try {
-                    $tmpLS = "$($sync.LsDir)_old_$(Get-Date -Format 'HHmmss')"
-                    Rename-Item -Path $sync.LsDir -NewName $tmpLS -ErrorAction SilentlyContinue
-                    Remove-Item -Path $tmpLS -Recurse -Force -ErrorAction SilentlyContinue
-                } catch { Log "Warning: Busy folder. Continuing..." }
+                Log "Target directory already exists: $($sync.LsDir). Skipping clone."
+            } else {
+                Log "Cloning Label Studio (Full Repository)..."
+                $res = Exec "git" "clone --progress $($sync.RepoLS) label-studio-dev" $sync.InstallPath
+                if ($res -ne 0) { throw "Git clone LS failed with code $res" }
             }
-            
-            Log "Cloning Label Studio (Full Repository)..."
-            $res = Exec "git" "clone --progress $($sync.RepoLS) label-studio-dev" $sync.InstallPath
-            if ($res -ne 0) { throw "Git clone LS failed with code $res" }
             
             Log "Switching to dev branch..."
             Exec "git" "checkout dev" $sync.LsDir
@@ -426,17 +435,12 @@ function Start-Installation {
             if ($sync.WithML) {
                 $sync.Progress = 3
                 if (Test-Path $sync.MlDir) {
-                    Log "Cleaning legacy ML folder..."
-                    try {
-                        $tmpML = "$($sync.MlDir)_old_$(Get-Date -Format 'HHmmss')"
-                        Rename-Item -Path $sync.MlDir -NewName $tmpML -ErrorAction SilentlyContinue
-                        Remove-Item -Path $tmpML -Recurse -Force -ErrorAction SilentlyContinue
-                    } catch { Log "Warning: Busy folder. Continuing..." }
+                    Log "ML Backend directory already exists: $($sync.MlDir). Skipping clone."
+                } else {
+                    Log "Cloning ML Backend (Full Repository)..."
+                    $resML = Exec "git" "clone --progress $($sync.RepoML) label-studio-ml-backend-dev" $sync.InstallPath
+                    if ($resML -ne 0) { throw "Git clone ML failed with code $resML" }
                 }
-                
-                Log "Cloning ML Backend (Full Repository)..."
-                $resML = Exec "git" "clone --progress $($sync.RepoML) label-studio-ml-backend-dev" $sync.InstallPath
-                if ($resML -ne 0) { throw "Git clone ML failed with code $resML" }
                 
                 Log "Switching to dev branch in ML Backend..."
                 Exec "git" "checkout dev" $sync.MlDir
@@ -445,17 +449,31 @@ function Start-Installation {
             # 4. Poetry
             $sync.Progress = 4
             Log "Installing/Updating Poetry..."
-            Exec "python" "-m pip install poetry" ""
+            Exec $sync.PythonPath "-m pip install poetry" ""
 
             # 5. LS Setup
             $sync.Progress = 5
             Log "Configuring Poetry to use in-project virtual environment..."
-            # Use 'poetry' directly instead of 'python -m poetry'
-            Exec "poetry" "config virtualenvs.in-project true" $sync.LsDir
+            Exec $sync.PythonPath "-m poetry config virtualenvs.in-project true" $sync.LsDir
 
             Log "Running poetry install (this part is slow, will create .venv)..."
-            $resInstall = Exec "poetry" "install" $sync.LsDir
-            if ($resInstall -ne 0) { throw "Poetry install failed with code $resInstall" }
+            $resInstall = Exec $sync.PythonPath "-m poetry install" $sync.LsDir
+            
+            # If install fails because of lock file mismatch (bypass slow poetry lock)
+            if ($resInstall -ne 0) {
+                Log "Poetry install/lock mismatch detected. Switching to FAST MODE (pip install)..."
+                # Use pip to satisfy dependencies directly from pyproject.toml, ignoring the lock file
+                # First ensure pip is in the venv (usually is)
+                $venvPip = Join-Path $sync.LsDir ".venv\Scripts\pip.exe"
+                if (Test-Path $venvPip) {
+                    $resInstall = Exec $venvPip "install -e ." $sync.LsDir
+                } else {
+                    Log "Virtual environment not found, trying pip via python..."
+                    $resInstall = Exec $sync.PythonPath "-m pip install -e ." $sync.LsDir
+                }
+            }
+            
+            if ($resInstall -ne 0) { throw "Installation failed (tried both Poetry and Pip)" }
             
             # 6. Django (Run within the activated .venv environment)
             $sync.Progress = 7
@@ -463,9 +481,9 @@ function Start-Installation {
             
             if (!(Test-Path $venvPython)) {
                 Log "Warning: Activated .venv python not found. Falling back to poetry run..."
-                $pyCmd = "poetry"
-                $pyArgsMigrate = "run python label_studio/manage.py migrate"
-                $pyArgsCollect = "run python label_studio/manage.py collectstatic --noinput"
+                $pyCmd = $sync.PythonPath
+                $pyArgsMigrate = "-m poetry run python label_studio/manage.py migrate"
+                $pyArgsCollect = "-m poetry run python label_studio/manage.py collectstatic --noinput"
             } else {
                 Log "Activating environment (using $venvPython)..."
                 $pyCmd = $venvPython
@@ -508,7 +526,7 @@ function Start-Installation {
                     Log "Warning: ML Backend directory not found, skipping setup."
                 } else {
                     Log "Creating virtual environment for ML Backend..."
-                    $resVenv = Exec "python" "-m venv .venv" $sync.MlDir
+                    $resVenv = Exec $sync.PythonPath "-m venv .venv" $sync.MlDir
                     if ($resVenv -ne 0) { throw "ML venv creation failed" }
 
                     $mlPip = Join-Path $sync.MlDir ".venv\Scripts\pip.exe"
